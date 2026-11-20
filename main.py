@@ -1,299 +1,302 @@
+"""StegoCrypt - hide AES-encrypted text inside a PNG image.   Run:  py main.py"""
 import os
-import struct
-import hashlib
 import tkinter as tk
-from tkinter import filedialog, messagebox
+from tkinter import filedialog, messagebox, ttk
+
 from PIL import Image, ImageTk
-from Crypto.Cipher import AES
-from Crypto.Random import get_random_bytes
+
+import core
+from core import StegoError
+
+BG, PANEL, TEXT, MUTED = "#efede8", "#ffffff", "#232323", "#6b6760"
+ACCENT, ACCENT_DK, DANGER, OK, LINE = "#2f5d62", "#244a4e", "#a33a2c", "#3b7a4f", "#cfcac0"
+IMAGE_TYPES = [("Images", "*.png *.bmp *.jpg *.jpeg *.webp *.gif *.tif *.tiff"), ("All files", "*.*")]
+LOSSLESS_TYPES = [("PNG / BMP (lossless)", "*.png *.bmp"), ("All files", "*.*")]
+PREVIEW = (380, 300)
 
 
-def derive_key_from_password(password: str, salt: bytes, iterations: int = 200_000) -> bytes:
-    return hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), salt, iterations, dklen=32)
-
-def encrypt_with_password(password: str, data: bytes) -> bytes:
-    salt = get_random_bytes(16)
-    key = derive_key_from_password(password, salt)
-    cipher = AES.new(key, AES.MODE_EAX)
-    ciphertext, tag = cipher.encrypt_and_digest(data)
-    return salt + cipher.nonce + tag + ciphertext
-
-def decrypt_with_password(password: str, blob: bytes) -> bytes:
-    if len(blob) < 48:
-        raise ValueError("Invalid encrypted data format.")
-    salt = blob[:16]
-    nonce = blob[16:32]
-    tag = blob[32:48]
-    ciphertext = blob[48:]
-    key = derive_key_from_password(password, salt)
-    cipher = AES.new(key, AES.MODE_EAX, nonce=nonce)
-    plaintext = cipher.decrypt_and_verify(ciphertext, tag)
-    return plaintext
-
-
-def _bytes_to_bits(data: bytes):
-    for byte in data:
-        for i in range(7, -1, -1):
-            yield (byte >> i) & 1
-
-def _bits_to_bytes(bits):
-    b = bytearray()
-    cur = 0
-    cnt = 0
-    for bit in bits:
-        cur = (cur << 1) | bit
-        cnt += 1
-        if cnt == 8:
-            b.append(cur)
-            cur = 0
-            cnt = 0
-    return bytes(b)
-
-def embed_data_in_image(image_path: str, data: bytes, output_path: str):
-    img = Image.open(image_path)
-    if img.mode not in ('RGB', 'RGBA'):
-        img = img.convert('RGB')
-    pixels = list(img.getdata())
-    length = len(data)
-    header = struct.pack('>I', length)
-    full = header + data
-    bits = list(_bytes_to_bits(full))
-    capacity = len(pixels) * 3
-    if len(bits) > capacity:
-        raise ValueError(f"Not enough capacity. Required bits: {len(bits)}, Capacity: {capacity}")
-    out_pixels = []
-    bit_idx = 0
-    for pix in pixels:
-        r, g, b = pix[:3]
-        new_rgb = []
-        for channel in (r, g, b):
-            if bit_idx < len(bits):
-                channel = (channel & ~1) | bits[bit_idx]
-                bit_idx += 1
-            new_rgb.append(channel)
-        if len(pix) == 4:
-            out_pixels.append(tuple(new_rgb + [pix[3]]))
-        else:
-            out_pixels.append(tuple(new_rgb))
-    img_out = Image.new(img.mode, img.size)
-    img_out.putdata(out_pixels)
-    img_out.save(output_path)
-
-def extract_data_from_image(image_path: str) -> bytes:
-    img = Image.open(image_path)
-    if img.mode not in ('RGB', 'RGBA'):
-        img = img.convert('RGB')
-    pixels = list(img.getdata())
-    bits = []
-    for pix in pixels:
-        r, g, b = pix[:3]
-        bits.append(r & 1)
-        bits.append(g & 1)
-        bits.append(b & 1)
-    header_bits = bits[:32]
-    header_bytes = _bits_to_bytes(header_bits)
-    length = struct.unpack('>I', header_bytes)[0]
-    total_bits_needed = (length + 4) * 8
-    if total_bits_needed > len(bits):
-        raise ValueError("Image does not contain enough data or is corrupted.")
-    data_bits = bits[32:32 + length * 8]
-    data = _bits_to_bytes(data_bits)
-    return data
-
-def max_embed_bytes_for_image(path):
+def preview_image(path):
     img = Image.open(path)
-    if img.mode not in ('RGB', 'RGBA'):
-        img = img.convert('RGB')
-    w, h = img.size
-    capacity_bits = w * h * 3
-    max_bytes = (capacity_bits - 32) // 8
-    return max_bytes
+    img.thumbnail(PREVIEW)
+    return ImageTk.PhotoImage(img.convert("RGBA"))
 
 
-class StegoApp:
+class ImagePane(ttk.Frame):
+    """Framed preview with a caption line."""
+
+    def __init__(self, master, placeholder):
+        super().__init__(master)
+        holder = tk.Frame(self, width=PREVIEW[0], height=PREVIEW[1], bg="#e4e1da",
+                          highlightthickness=1, highlightbackground=LINE)
+        holder.pack()
+        holder.pack_propagate(False)          # fixed pixel size, whatever the image inside
+        self.box = tk.Label(holder, text=placeholder, fg=MUTED, bg="#e4e1da", font=("Segoe UI", 10))
+        self.box.pack(fill="both", expand=True)
+        self.caption = ttk.Label(self, text="", style="Muted.TLabel", anchor="w")
+        self.caption.pack(fill="x", pady=(6, 0))
+        self._img = None
+
+    def show(self, path, caption):
+        self._img = preview_image(path)
+        self.box.config(image=self._img, text="")
+        self.caption.config(text=caption)
+
+
+class App:
     def __init__(self, root):
         self.root = root
-        root.title("StegoCrypt - Image Encryption & Hiding Tool")
-        self.input_path = None
-        self.output_path = None
+        root.title("StegoCrypt")
+        root.geometry("940x640")
+        root.minsize(820, 580)
+        root.configure(bg=BG)
+        self.src = self.out = self.enc_img = None
+        self.cap = 0
+        self._style()
 
-        top = tk.Frame(root, bg="#2c3e50")
-        top.pack(padx=10, pady=10, fill="x")
+        head = tk.Frame(root, bg=ACCENT)
+        head.pack(fill="x")
+        tk.Label(head, text="StegoCrypt", bg=ACCENT, fg="white", font=("Segoe UI Semibold", 16)).pack(side="left", padx=18, pady=10)
+        tk.Label(head, text="AES-256 encrypted text, hidden in the pixels of a PNG", bg=ACCENT, fg="#c9dcdc",
+                 font=("Segoe UI", 10)).pack(side="left", pady=10)
 
-        tk.Button(top, text="🔒 Embed Data", command=self.open_embed_window, bg="#27ae60", fg="white", font=("Arial", 10, "bold")).pack(side="left", padx=8)
-        tk.Button(top, text="🔓 Extract Data", command=self.open_extract_window, bg="#2980b9", fg="white", font=("Arial", 10, "bold")).pack(side="left", padx=8)
+        self.status = tk.StringVar(value="Choose an image to begin.")
+        self.status_lbl = tk.Label(root, textvariable=self.status, bg=BG, fg=MUTED, anchor="w", font=("Segoe UI", 9))
+        self.status_lbl.pack(side="bottom", fill="x", padx=18, pady=(0, 8))
 
-        label = tk.Label(root, text="Welcome to StegoCrypt", font=("Arial", 14, "bold"))
-        label.pack(pady=10)
-        tk.Label(root, text="Hide encrypted messages inside PNG images securely.", font=("Arial", 10)).pack()
+        self.nb = ttk.Notebook(root)
+        self.nb.pack(fill="both", expand=True, padx=14, pady=(12, 6))
+        hide, reveal = ttk.Frame(self.nb, padding=16), ttk.Frame(self.nb, padding=16)
+        self.nb.add(hide, text="  Hide text  ")
+        self.nb.add(reveal, text="  Reveal text  ")
+        self._build_hide(hide)
+        self._build_reveal(reveal)
+        root.bind("<Control-Return>", lambda e: self.do_hide() if self.nb.index("current") == 0 else self.do_reveal())
 
-    def open_embed_window(self):
-        win = tk.Toplevel(self.root)
-        win.title("Embed Encrypted Text into Image")
-        win.geometry("700x600")
+    # ------------------------------------------------------------ styling --
+    def _style(self):
+        s = ttk.Style()
+        s.theme_use("clam")
+        s.configure(".", background=BG, foreground=TEXT, font=("Segoe UI", 10))
+        s.configure("TFrame", background=BG)
+        s.configure("TLabel", background=BG)
+        s.configure("Muted.TLabel", foreground=MUTED, font=("Segoe UI", 9))
+        s.configure("H.TLabel", font=("Segoe UI Semibold", 10))
+        s.configure("TNotebook", background=BG, borderwidth=0)
+        s.configure("TNotebook.Tab", padding=(6, 7), background="#e3e0d9", foreground=MUTED, borderwidth=0)
+        s.map("TNotebook.Tab", background=[("selected", BG)], foreground=[("selected", ACCENT)])
+        s.configure("TButton", padding=(12, 7), background="#e3e0d9", borderwidth=1, bordercolor=LINE, focuscolor=BG)
+        s.map("TButton", background=[("active", "#d9d5cc")])
+        s.configure("Accent.TButton", background=ACCENT, foreground="white", bordercolor=ACCENT, padding=(16, 9),
+                    font=("Segoe UI Semibold", 10))
+        s.map("Accent.TButton", background=[("active", ACCENT_DK), ("disabled", "#9fb5b7")])
+        s.configure("TEntry", fieldbackground=PANEL, bordercolor=LINE, padding=6)
+        s.configure("TCheckbutton", background=BG)
+        s.configure("Cap.Horizontal.TProgressbar", troughcolor="#ded9ce", background=OK, bordercolor=BG, thickness=8)
+        s.configure("Over.Horizontal.TProgressbar", troughcolor="#ded9ce", background=DANGER, bordercolor=BG, thickness=8)
 
-        frame = tk.Frame(win)
-        frame.pack(fill="both", expand=True, padx=8, pady=8)
+    def say(self, msg, kind="info"):
+        self.status.set(msg)
+        self.status_lbl.config(fg={"info": MUTED, "ok": OK, "error": DANGER}[kind])
 
-        img_sel_frame = tk.Frame(frame)
-        img_sel_frame.pack(fill="x", pady=4)
-        tk.Button(img_sel_frame, text="Select Source Image", command=lambda: self.select_input_image_for_embed(win)).pack(side="left")
-        self.embed_capacity_label = tk.Label(img_sel_frame, text="(No image selected yet)")
-        self.embed_capacity_label.pack(side="left", padx=8)
+    def _text_box(self, master, height, state="normal"):
+        wrap = ttk.Frame(master)
+        t = tk.Text(wrap, height=height, wrap="word", bg=PANEL, fg=TEXT, relief="flat", font=("Segoe UI", 10),
+                    highlightthickness=1, highlightbackground=LINE, highlightcolor=ACCENT, padx=8, pady=6, undo=True)
+        sb = ttk.Scrollbar(wrap, command=t.yview)
+        t.config(yscrollcommand=sb.set, state=state)
+        sb.pack(side="right", fill="y")
+        t.pack(side="left", fill="both", expand=True)
+        return wrap, t
 
-        self.preview_label_emb = tk.Label(frame, text="No image preview", width=60, height=12, bd=1, relief="sunken")
-        self.preview_label_emb.pack(pady=6)
+    def _password(self, master, label, show_var):
+        ttk.Label(master, text=label, style="H.TLabel").pack(anchor="w", pady=(10, 3))
+        e = ttk.Entry(master, show="•")
+        e.pack(fill="x")
+        show_var.trace_add("write", lambda *_: e.config(show="" if show_var.get() else "•"))
+        return e
 
-        tk.Label(frame, text="Text to hide:").pack(anchor="w")
-        self.text_box = tk.Text(frame, height=8)
-        self.text_box.pack(fill="x", pady=(0,8))
+    # ---------------------------------------------------------- hide tab --
+    def _build_hide(self, f):
+        left, right = ttk.Frame(f), ttk.Frame(f)
+        left.pack(side="left", fill="y", padx=(0, 18))
+        right.pack(side="left", fill="both", expand=True)
 
-        pw_frame = tk.Frame(frame)
-        pw_frame.pack(fill="x", pady=4)
-        tk.Label(pw_frame, text="Password (to share with recipient):").pack(side="left")
-        self.password_entry = tk.Entry(pw_frame, show="*")
-        self.password_entry.pack(side="left", padx=6)
+        self.pane_src = ImagePane(left, "No image selected")
+        self.pane_src.pack(fill="both", expand=True)
+        ttk.Button(left, text="Choose image…", command=self.pick_source).pack(anchor="w", pady=(10, 4))
+        self.cap_bar = ttk.Progressbar(left, style="Cap.Horizontal.TProgressbar", maximum=100)
+        self.cap_bar.pack(fill="x", pady=(6, 2))
+        self.cap_lbl = ttk.Label(left, text="Capacity: -", style="Muted.TLabel")
+        self.cap_lbl.pack(anchor="w")
 
-        out_frame = tk.Frame(frame)
-        out_frame.pack(fill="x", pady=4)
-        tk.Button(out_frame, text="Select Output File", command=lambda: self.select_output_path(win)).pack(side="left")
-        self.output_path_label = tk.Label(out_frame, text="(No output selected)")
-        self.output_path_label.pack(side="left", padx=8)
+        ttk.Label(right, text="Text to hide", style="H.TLabel").pack(anchor="w", pady=(0, 3))
+        wrap, self.msg = self._text_box(right, 7)
+        wrap.pack(fill="both", expand=True)
+        self.msg.bind("<<Modified>>", self._msg_changed)
 
-        tk.Button(frame, text="Encrypt & Embed", bg="#2ecc71", fg="white", command=self.action_encrypt_and_embed).pack(pady=8)
+        self.show_pw = tk.BooleanVar()
+        self.pw1 = self._password(right, f"Password (at least {core.MIN_PASSWORD_LEN} characters)", self.show_pw)
+        ttk.Label(right, text="Repeat password", style="H.TLabel").pack(anchor="w", pady=(10, 3))
+        self.pw2 = ttk.Entry(right, show="•")
+        self.pw2.pack(fill="x")
+        self.show_pw.trace_add("write", lambda *_: self.pw2.config(show="" if self.show_pw.get() else "•"))
+        ttk.Checkbutton(right, text="Show passwords", variable=self.show_pw).pack(anchor="w", pady=(8, 0))
+        ttk.Label(right, text="There is no password recovery: lose it and the text is gone.", style="Muted.TLabel").pack(anchor="w", pady=(2, 0))
 
-    def select_input_image_for_embed(self, window):
-        path = filedialog.askopenfilename(title="Select Image", filetypes=[("PNG", "*.png")])
+        row = ttk.Frame(right)
+        row.pack(fill="x", pady=(14, 0))
+        self.go_hide = ttk.Button(row, text="Encrypt & hide", style="Accent.TButton", command=self.do_hide)
+        self.go_hide.pack(side="left")
+        ttk.Label(row, text="Ctrl+Enter", style="Muted.TLabel").pack(side="left", padx=10)
+
+    def pick_source(self):
+        path = filedialog.askopenfilename(title="Choose a cover image", filetypes=IMAGE_TYPES)
         if not path:
             return
-        self.input_path = path
-        max_bytes = max_embed_bytes_for_image(path)
-        self.embed_capacity_label.config(text=f"Max embed capacity: {max_bytes} bytes")
-        img = Image.open(path)
-        img.thumbnail((500, 350))
-        self.embed_tkimg = ImageTk.PhotoImage(img)
-        self.preview_label_emb.config(image=self.embed_tkimg, text="")
+        try:
+            self.pane_src.show(path, os.path.basename(path))
+            self.cap = core.capacity_bytes(path)
+        except Exception as e:
+            self.say(f"Cannot open that image: {e}", "error")
+            return
+        self.src, self.out = path, None
+        self._update_capacity()
+        self.say(f"Image loaded. Up to {self.cap:,} bytes can be hidden in it.")
 
-    def select_output_path(self, window):
-        path = filedialog.asksaveasfilename(defaultextension=".png", filetypes=[("PNG", "*.png")], title="Save as")
+    def _msg_changed(self, _=None):
+        if self.msg.edit_modified():
+            self.msg.edit_modified(False)
+            self._update_capacity()
+
+    def _update_capacity(self):
+        if not self.src:
+            return
+        need = len(self.msg.get("1.0", "end-1c").encode("utf-8")) + 56  # 56 = format header, salt, nonce, tag
+        pct = min(100, 100 * need / max(1, self.cap))
+        over = need > self.cap
+        self.cap_bar.config(value=pct, style="Over.Horizontal.TProgressbar" if over else "Cap.Horizontal.TProgressbar")
+        self.cap_lbl.config(text=f"Uses {need:,} of {self.cap:,} bytes" + ("  -  too large, pick a bigger image" if over else ""),
+                            foreground=DANGER if over else MUTED)
+
+    def do_hide(self):
+        text = self.msg.get("1.0", "end-1c")
+        if not self.src:
+            return self.say("Choose a cover image first.", "error")
+        if not text.strip():
+            return self.say("Type the text you want to hide.", "error")
+        if self.pw1.get() != self.pw2.get():
+            return self.say("The two passwords do not match.", "error")
+        if not self.out:
+            base = os.path.splitext(os.path.basename(self.src))[0] + "_hidden.png"
+            self.out = filedialog.asksaveasfilename(title="Save the new image as", defaultextension=".png",
+                                                    initialfile=base, filetypes=[("PNG", "*.png")]) or None
+            if not self.out:
+                return
+        if os.path.abspath(self.out) == os.path.abspath(self.src):
+            self.out = None
+            return self.say("Do not overwrite the original image - choose another file name.", "error")
+        self.root.config(cursor="watch")
+        self.root.update_idletasks()
+        try:
+            n = core.encrypt_into_image(self.src, text, self.pw1.get(), self.out)
+        except StegoError as e:
+            return self.say(str(e), "error")
+        except OSError as e:
+            return self.say(f"Could not write the file: {e}", "error")
+        finally:
+            self.root.config(cursor="")
+        self.say(f"Done - {n:,} encrypted bytes hidden in {os.path.basename(self.out)}.", "ok")
+        messagebox.showinfo("StegoCrypt", f"Saved:\n{self.out}\n\nShare it as a file, not through apps that re-compress images.")
+        self.out = None
+
+    # -------------------------------------------------------- reveal tab --
+    def _build_reveal(self, f):
+        left, right = ttk.Frame(f), ttk.Frame(f)
+        left.pack(side="left", fill="y", padx=(0, 18))
+        right.pack(side="left", fill="both", expand=True)
+
+        self.pane_enc = ImagePane(left, "No image selected")
+        self.pane_enc.pack(fill="both", expand=True)
+        ttk.Button(left, text="Choose image…", command=self.pick_encrypted).pack(anchor="w", pady=(10, 0))
+
+        self.show_pw2 = tk.BooleanVar()
+        self.pw_ext = self._password(right, "Password", self.show_pw2)
+        self.pw_ext.bind("<Return>", lambda e: self.do_reveal())
+        ttk.Checkbutton(right, text="Show password", variable=self.show_pw2).pack(anchor="w", pady=(8, 0))
+        self.go_rev = ttk.Button(right, text="Reveal text", style="Accent.TButton", command=self.do_reveal)
+        self.go_rev.pack(anchor="w", pady=(14, 12))
+
+        ttk.Label(right, text="Hidden text", style="H.TLabel").pack(anchor="w", pady=(0, 3))
+        wrap, self.result = self._text_box(right, 7, state="disabled")
+        wrap.pack(fill="both", expand=True)
+        row = ttk.Frame(right)
+        row.pack(fill="x", pady=(10, 0))
+        ttk.Button(row, text="Copy", command=self.copy_result).pack(side="left")
+        ttk.Button(row, text="Save as .txt…", command=self.save_result).pack(side="left", padx=8)
+
+    def pick_encrypted(self):
+        path = filedialog.askopenfilename(title="Choose the image with hidden text", filetypes=LOSSLESS_TYPES)
         if not path:
             return
-        self.output_path = path
-        self.output_path_label.config(text=path)
+        try:
+            self.pane_enc.show(path, os.path.basename(path))
+        except Exception as e:
+            return self.say(f"Cannot open that image: {e}", "error")
+        self.enc_img = path
+        self._set_result("")
+        self.say("Enter the password and press Reveal.")
 
-    def action_encrypt_and_embed(self):
-        if not self.input_path:
-            messagebox.showerror("Error", "Select a source image first.")
-            return
-        if not self.output_path:
-            messagebox.showerror("Error", "Select an output file first.")
-            return
-        text = self.text_box.get("1.0", "end").strip()
+    def _set_result(self, text):
+        self.result.config(state="normal")
+        self.result.delete("1.0", "end")
+        self.result.insert("1.0", text)
+        self.result.config(state="disabled")
+
+    def do_reveal(self):
+        if not self.enc_img:
+            return self.say("Choose the image first.", "error")
+        if not self.pw_ext.get():
+            return self.say("Enter the password.", "error")
+        self.root.config(cursor="watch")
+        self.root.update_idletasks()
+        try:
+            text = core.decrypt_from_image(self.enc_img, self.pw_ext.get())
+        except StegoError as e:
+            self._set_result("")
+            return self.say(str(e), "error")
+        finally:
+            self.root.config(cursor="")
+        self._set_result(text)
+        self.say(f"Decrypted {len(text):,} characters.", "ok")
+
+    def copy_result(self):
+        text = self.result.get("1.0", "end-1c")
+        if text:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text)
+            self.say("Copied to the clipboard.", "ok")
+
+    def save_result(self):
+        text = self.result.get("1.0", "end-1c")
         if not text:
-            messagebox.showerror("Error", "Text cannot be empty.")
-            return
-        password = self.password_entry.get().strip()
-        if not password or len(password) < 6:
-            messagebox.showerror("Error", "Password must be at least 6 characters.")
-            return
-        try:
-            encrypted_blob = encrypt_with_password(password, text.encode('utf-8'))
-        except Exception as e:
-            messagebox.showerror("Encryption Error", str(e))
-            return
-        max_bytes = max_embed_bytes_for_image(self.input_path)
-        if len(encrypted_blob) > max_bytes:
-            messagebox.showerror("Error", f"Image too small. Required: {len(encrypted_blob)}, Capacity: {max_bytes}")
-            return
-        try:
-            embed_data_in_image(self.input_path, encrypted_blob, self.output_path)
-        except Exception as e:
-            messagebox.showerror("Embedding Error", str(e))
-            return
-        messagebox.showinfo("Success", f"Data successfully encrypted and embedded!\nSaved as: {self.output_path}")
-
-    def open_extract_window(self):
-        win = tk.Toplevel(self.root)
-        win.title("Extract & Decrypt Hidden Text")
-        win.geometry("700x550")
-
-        frame = tk.Frame(win)
-        frame.pack(fill="both", expand=True, padx=8, pady=8)
-
-        img_sel_frame = tk.Frame(frame)
-        img_sel_frame.pack(fill="x", pady=4)
-        tk.Button(img_sel_frame, text="Select Encrypted Image", command=lambda: self.select_input_image_for_extract(win)).pack(side="left")
-        self.extract_info_label = tk.Label(img_sel_frame, text="(No image selected)")
-        self.extract_info_label.pack(side="left", padx=8)
-
-        self.preview_label_ext = tk.Label(frame, text="No image preview", width=60, height=12, bd=1, relief="sunken")
-        self.preview_label_ext.pack(pady=6)
-
-        pw_frame = tk.Frame(frame)
-        pw_frame.pack(fill="x", pady=4)
-        tk.Label(pw_frame, text="Password:").pack(side="left")
-        self.password_entry_ext = tk.Entry(pw_frame, show="*")
-        self.password_entry_ext.pack(side="left", padx=6)
-
-        tk.Button(frame, text="Extract & Decrypt", bg="#3498db", fg="white", command=self.action_extract_and_decrypt).pack(pady=6)
-
-        tk.Label(frame, text="Decrypted text:").pack(anchor="w")
-        self.decrypted_text_box = tk.Text(frame, height=8)
-        self.decrypted_text_box.pack(fill="x", pady=(0,8))
-
-        tk.Button(frame, text="Save Decrypted Text", command=self.save_decrypted_to_file).pack(pady=6)
-
-    def select_input_image_for_extract(self, window):
-        path = filedialog.askopenfilename(title="Select Encrypted Image", filetypes=[("PNG", "*.png")])
-        if not path:
-            return
-        self.input_path = path
-        img = Image.open(path)
-        img.thumbnail((500, 350))
-        self.extract_tkimg = ImageTk.PhotoImage(img)
-        self.preview_label_ext.config(image=self.extract_tkimg, text="")
-        self.extract_info_label.config(text=f"Selected: {path}")
-
-    def action_extract_and_decrypt(self):
-        if not self.input_path:
-            messagebox.showerror("Error", "Select an encrypted image first.")
-            return
-        password = self.password_entry_ext.get().strip()
-        if not password:
-            messagebox.showerror("Error", "Enter the password.")
-            return
-        try:
-            embedded = extract_data_from_image(self.input_path)
-        except Exception as e:
-            messagebox.showerror("Extraction Error", str(e))
-            return
-        try:
-            plain = decrypt_with_password(password, embedded)
-        except Exception as e:
-            messagebox.showerror("Decryption Error", f"Failed to decrypt: {e}")
-            return
-        try:
-            text = plain.decode('utf-8')
-        except:
-            text = repr(plain)
-        self.decrypted_text_box.delete("1.0", "end")
-        self.decrypted_text_box.insert("1.0", text)
-        messagebox.showinfo("Success", "Data extracted and decrypted successfully!")
-
-    def save_decrypted_to_file(self):
-        content = self.decrypted_text_box.get("1.0", "end").strip()
-        if not content:
-            messagebox.showerror("Error", "No text to save.")
-            return
+            return self.say("Nothing to save yet.", "error")
         path = filedialog.asksaveasfilename(defaultextension=".txt", filetypes=[("Text", "*.txt")])
-        if not path:
-            return
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(content)
-        messagebox.showinfo("Saved", f"Decrypted text saved to: {path}")
+        if path:
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(text)
+            self.say(f"Saved {os.path.basename(path)}.", "ok")
+
+
+def main():
+    try:  # crisp text on high-DPI Windows screens
+        from ctypes import windll
+        windll.shcore.SetProcessDpiAwareness(1)
+    except Exception:
+        pass
+    root = tk.Tk()
+    App(root)
+    root.mainloop()
 
 
 if __name__ == "__main__":
-    root = tk.Tk()
-    app = StegoApp(root)
-    root.mainloop()
+    main()

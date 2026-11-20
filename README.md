@@ -1,87 +1,66 @@
-🧠 ENCRYPT-TEXT  
-Encrypt your text inside an image — AES-based secure steganography tool.
+# ENCRYPT-TEXT (StegoCrypt)
 
-This project allows you to encrypt any text message using AES encryption and hide it inside a PNG image.
-The hidden message can only be decrypted with the same password.
+Hide a text message inside a PNG image. The text is encrypted with **AES-256** under a password you choose, and the result is written into the image's pixels. Without the password, the image is just an image.
 
-------------------------------------------------------------
-⚙️ INSTALLATION
-------------------------------------------------------------
+| Hide text | Reveal text |
+|---|---|
+| ![Hide tab](docs/hide.png) | ![Reveal tab](docs/reveal.png) |
 
-🪟 FOR WINDOWS
-------------------------------------------------------------
-1️⃣ Make sure you have Python 3.9+ installed.  
-   Check it with:
-   python --version
+## Quick start
 
-2️⃣ Install required libraries:
-   pip install pycryptodome pillow
+Requires Python 3.9+ (tkinter ships with the standard Windows/macOS installers; on Debian/Ubuntu: `sudo apt install python3-tk`).
 
-3️⃣ Test the installation:
-   python -c "from Crypto.Cipher import AES; from PIL import Image; print('Libraries OK ✅')"
+```bash
+git clone https://github.com/mehdiuslu/ENCRYPT-TEXT.git
+cd ENCRYPT-TEXT
+python -m pip install -r requirements.txt
+python main.py            # on Windows: py main.py
+```
 
-------------------------------------------------------------
-🐧 FOR LINUX (Ubuntu / Kali / Arch / Debian)
-------------------------------------------------------------
-1️⃣ If Python3 is not installed:
-   sudo apt install python3 python3-pip -y
+**Hide:** choose a cover image → type the text → set a password (twice) → *Encrypt & hide*. A new PNG is written; your original is never touched.
+**Reveal:** choose that PNG → enter the password → *Reveal text*.
 
-2️⃣ Install the required libraries:
-   python3 -m pip install --user pycryptodome pillow
+The capacity bar shows how much of the image the message uses. Share the result **as a file**: messengers that re-compress photos (JPEG) destroy the hidden data.
 
-3️⃣ Test the installation:
-   python3 -c "from Crypto.Cipher import AES; from PIL import Image; print('Libraries OK ✅')"
+## How it works
 
-------------------------------------------------------------
-📦 DEPENDENCIES
-------------------------------------------------------------
-• pycryptodome  → AES encryption and hashing  
-• pillow        → PNG read/write for steganography
+1. **Key derivation:** PBKDF2-HMAC-SHA256, 600 000 iterations, random 16-byte salt.
+2. **Encryption:** AES-256 in EAX mode (authenticated). A wrong password or a modified image is detected, not silently decoded to garbage.
+3. **Hiding:** the encrypted blob is written into the least-significant bit of the R, G and B channels (1 bit per channel, alpha untouched), so no pixel value changes by more than 1.
 
-------------------------------------------------------------
-🪄 HOW TO USE
-------------------------------------------------------------
-1️⃣ Clone this repository:
-   git clone https://github.com/mehdiuslu/ENCRYPT-TEXT.git
-   cd ENCRYPT-TEXT
+Hidden data layout: `length(4) | "SGC2"(4) | iterations(4) | salt(16) | nonce(16) | tag(16) | ciphertext`. Images made by the first version of this tool are still readable.
 
-2️⃣ Run the program:
-   python main.py
-   (or on Linux)
-   python3 main.py
+The crypto and image code live in `core.py` (no GUI), so they can be used or tested on their own:
 
-3️⃣ Follow the steps in the terminal:
-   - Type the text you want to encrypt  
-   - Choose a password (don’t forget it!)  
-   - Select a .png image to embed the encrypted data  
+```python
+import core
+core.encrypt_into_image("cover.jpg", "meet at noon", "a long password", "hidden.png")
+print(core.decrypt_from_image("hidden.png", "a long password"))
+```
 
-4️⃣ Output:
-   A new file named “encrypted_output.png” will be created.
-   This file contains your AES-encrypted and hidden text.
+## Tests
 
-------------------------------------------------------------
-🔐 EXAMPLE
-------------------------------------------------------------
-Enter text to encrypt: Hello world!
-Enter password: ********
-Select image: input.png
-✅ Encrypted image created: encrypted_output.png
+```bash
+python -m unittest -v     # 13 tests: round-trips (RGB/RGBA/L/P), wrong password, tampering,
+                          # capacity limits, backward compatibility, malformed input
+```
 
-------------------------------------------------------------
-❗ TROUBLESHOOTING
-------------------------------------------------------------
-❌ ModuleNotFoundError: No module named 'Crypto'  
-➡ pip install pycryptodome
+## Honest limitations
 
-❌ ImportError: No module named 'PIL'  
-➡ pip install pillow
+- **Encryption is strong; hiding is not stealthy.** Plain LSB embedding fills the first pixels sequentially and is detectable by statistical steganalysis. Anyone who suspects the image can tell *something* is in it — they just can't read it. If hiding the *existence* of the message matters, this is not enough.
+- **Lossless formats only.** Output is always PNG. Re-saving as JPEG, resizing, or screenshotting destroys the data.
+- **No password recovery.** The password is not stored anywhere.
+- It has not been independently audited. Use a long, unique password.
 
-❌ UnicodeEncodeError  
-➡ Save your file as UTF-8
+## Changes in this version
 
-------------------------------------------------------------
-📜 LICENSE
-------------------------------------------------------------
-Free & Open Source  
-Developed by mehdiuslu 🧠
+- Rebuilt the GUI: one window with two tabs, live capacity bar, password confirmation and show/hide, clear error messages.
+- Fixed: the two separate windows shared one image path, so using both mixed up files.
+- Fixed: passwords were silently trimmed of leading/trailing spaces.
+- Fixed: very slow, memory-hungry embedding (a Python list of every pixel and bit); now works on raw bytes.
+- Hardened: PBKDF2 iterations 200 000 → 600 000 (stored in the file, old images still open), refuses absurd iteration counts from crafted images, minimum password 8 characters.
+- Removed the old `text.py` / `imagine.py` / `hash.py` three-step scripts. They did not run (`NameError`), and by design stored the AES key *inside* the image next to the ciphertext, so the "verification code" protected nothing.
 
+## License
+
+MIT — see [LICENSE](LICENSE).
